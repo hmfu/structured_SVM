@@ -1,10 +1,14 @@
-from utils import Data
 import tensorflow as tf
 import numpy as np
 import random
 import pickle
+import math
 import os
 import re
+
+config = tf.ConfigProto(allow_soft_placement = True)
+config.gpu_options.allow_growth = True
+config.gpu_options.per_process_gpu_memory_fraction = 0.5
 
 class Data_formater(object):
 
@@ -29,9 +33,9 @@ class Data_formater(object):
                     lyric_gap_input += [[self.get_lyric_gap(image_tuple[:2], tuple(arr)) for arr in self.lyric_topic_tag_array]]
                     answer_lyric_idx_input += [[lyric_tuple_idx]]
 
-        self.image_input = np.array(image_input)
-        self.lyric_gap_input = np.array(lyric_gap_input)
-        self.answer_lyric_idx_input = np.array(answer_lyric_idx_input)
+        self.image_input = np.array(image_input, dtype = np.float32)
+        self.lyric_gap_input = np.array(lyric_gap_input, dtype = np.float32)
+        self.answer_lyric_idx_input = np.array(answer_lyric_idx_input, dtype = np.float32)
 
     def get_lyric_gap(self, tuple1, tuple2):
         if tuple1 == tuple2:
@@ -79,8 +83,10 @@ class Data_formater(object):
         for idx in range(self.vocab_num):
             self.embedding_table += [self.embedding_dictionary[self.idx_vocab_dictionary[idx]]]
 
-        self.embedding_table += [[self.embedding_table[random.randint(0, self.vocab_num - 1)][d] for d in range(self.embedding_dimension)]]
+        self.embedding_table += [[self.embedding_table[random.randint(0, self.vocab_num - 1)][d] \
+                for d in range(self.embedding_dimension)]]
         self.embedding_table += [[0] * self.embedding_dimension]
+
         self.embedding_table = np.array(self.embedding_table, dtype = np.float32)
         
         # Convert words in the lyric tuples to index and fix their lengths. 
@@ -106,14 +112,10 @@ class Data_formater(object):
         with open(word2id_file_name, 'rb') as word2id_file:
             word2id_dictionary = pickle.load(word2id_file)
         
-        print (vectors_array[:5], word2id_dictionary)
         self.embedding_dimension = len(vectors_array[0])
 
         word_candidates = list(word2id_dictionary.keys())
         self.embedding_dictionary = {word: list(vectors_array[word2id_dictionary[word]]) for word in word_candidates}
-
-        #self.embedding_dimension = 3
-        #self.embedding_dictionary = {'i': [3.2, 4.5, 6.7], 'you': [5.4, 6.3, 9.6], 'love': [2.1, 7.8, 4.5], 'the': [3.2, 5.6, 7.1]}
 
     def load_images(self, data_directory, slice_idx_list):
 
@@ -134,20 +136,28 @@ class Data_formater(object):
                         self.image_tuple_list += [(topic_name, tag_name, image_vector)]
 
         self.image_dimension = len(self.image_tuple_list[0][2])
+        
+        self.all_image_array = np.array([image_tuple[2] for image_tuple in self.image_tuple_list], dtype = np.float32)
+        self.all_image_lyric_gap_array = np.array([[self.get_lyric_gap(image_tuple[:2], tuple(array)) \
+                for array in self.lyric_topic_tag_array] for image_tuple in self.image_tuple_list], dtype = np.float32)
 
 class Structured_SVM(object):
 
-    def __init__(self, weight_stddev, bias_stddev):
+    def __init__(self, weight_stddev, bias_stddev, slice_size):
         self.weight_stddev = weight_stddev
         self.bias_stddev = bias_stddev
+        self.slice_size = slice_size
 
-    def build_model(self, image_dimension, lyric_length, lyric_num, fully_connected_layer_num, embedding_dimension, C, embedding_table, pool_size, conv_filter_num_list, filter_size):
+    def build_model(self, image_dimension, lyric_length, lyric_num, fully_connected_layer_num, embedding_dimension, C, \
+            embedding_table, pool_size, conv_filter_num_list, filter_size):
         
         with tf.name_scope('input_placeholders'):
             
             self.image_input = tf.placeholder(dtype = tf.float32, shape = [None, image_dimension])
             self.lyric_input = tf.placeholder(dtype = tf.int32, shape = [lyric_num, lyric_length])
-            self.lyric_gap = tf.placeholder(dtype = tf.float32, shape = [None, lyric_num]) # 0.0 for answers, 0.5 for same topic, 1.0 for negative samples.
+            self.lyric_gap = tf.placeholder(dtype = tf.float32, shape = [None, lyric_num]) 
+            # lyric_gap: 0.0 for answers, 0.5 for same topic, 1.0 for negative samples.
+            
             self.C = tf.constant(C, dtype = tf.float32)
             self.embedding_table = tf.constant(embedding_table)
             self.answer_lyric_idx = tf.placeholder(dtype = tf.int32, shape = [None, 1])
@@ -163,7 +173,8 @@ class Structured_SVM(object):
                 sudo_batched_embedded_lyric = tf.nn.relu(sudo_batched_embedded_lyric)
 
             lyric_feature = tf.contrib.layers.flatten(tf.squeeze(sudo_batched_embedded_lyric, squeeze_dims = 0))
-            sudo_batched_lyric_feature = tf.tile(tf.expand_dims(lyric_feature, axis = 0), multiples = [-1, 1, 1])
+            image_num = tf.shape(self.image_input)[0]
+            sudo_batched_lyric_feature = tf.tile(tf.expand_dims(lyric_feature, axis = 0), multiples = [image_num, 1, 1])
 
         with tf.name_scope('get_scores'):
 
@@ -171,7 +182,7 @@ class Structured_SVM(object):
             image_lyric_pair = tf.concat([image_expanded, sudo_batched_lyric_feature], axis = 2)
 
             node_num_list = self.get_node_num_list(image_dimension+lyric_length, embedding_dimension, fully_connected_layer_num)
-            print ('node_num_list, embedding_dimension: ', node_num_list, embedding_dimension)
+            
             for layer_idx in range(fully_connected_layer_num):
                 
                 node_num = node_num_list[layer_idx]
@@ -186,7 +197,6 @@ class Structured_SVM(object):
 
         with tf.name_scope('get_loss'):
           
-            image_num = tf.shape(self.pair_score)[0]
             gather_idx = tf.concat([tf.expand_dims(tf.range(image_num), axis = 1), self.answer_lyric_idx], axis = 1)
             answer_score = tf.gather_nd(self.pair_score, gather_idx)
             answer_score_expanded = tf.tile(tf.expand_dims(answer_score, axis = 1), multiples = [1, lyric_num])
@@ -196,42 +206,88 @@ class Structured_SVM(object):
 
             self.loss = gap_loss + w_regularization_loss
 
-    def train_model(self, learning_rate, epoch_num, batch_size, image_input, lyric_gap_input, answer_lyric_idx_input, lyric_array):
-        optimizer = tf.train.AdamOptimizer(learning_rage = learning_rate).minimize(self.loss)
+    def train_model(self, learning_rate, epoch_num, batch_size, image_input, lyric_gap_input, answer_lyric_idx_input, \
+            lyric_array, all_image_array, all_image_lyric_gap_array, val_all_image_array, val_all_image_lyric_gap_array, \
+            ndcg_num):
+
+        optimizer = tf.train.AdamOptimizer(learning_rate = learning_rate).minimize(self.loss)
         
-        complete_feed_dict = {self.image_input: image_input, self.lyric_gap: lyric_gap_input, self.answer_lyric_idx: answer_lyric_idx_input}
+        complete_feed_dict = {self.image_input: image_input, self.lyric_gap: lyric_gap_input, \
+                self.answer_lyric_idx: answer_lyric_idx_input}
 
         sample_num = len(image_input)
         batch_num = sample_num // batch_size
 
         with tf.Session(config = config) as self.sess:
-            self.sess.run(global_variables_initializer())
+            self.sess.run(tf.global_variables_initializer())
 
             for epoch_idx in range(epoch_num):
+                print ('\ntraining epoch ', epoch_idx)
                 complete_feed_dict = self.shuffle_dictionary(complete_feed_dict)
 
                 for batch_idx in range(batch_num):
                     batch_feed_dict = self.get_batch(complete_feed_dict, batch_size, batch_idx * batch_size)
                     batch_feed_dict[self.lyric_input] = lyric_array
                     
-                    history = self.sess.run(optimizer)
+                    history = self.sess.run(optimizer, feed_dict = batch_feed_dict)
+
+                print ('training_ndcg: ', \
+                        self.evaluate_ndcg(all_image_array, all_image_lyric_gap_array, ndcg_num, lyric_array))
+                print ('validate_ndcg: ', \
+                        self.evaluate_ndcg(val_all_image_array, val_all_image_lyric_gap_array, ndcg_num, lyric_array))
+
+    def evaluate_ndcg(self, all_image_array, all_image_lyric_gap_array, ndcg_num, lyric_array):
+        
+        pair_score = self.run_pair_score_in_slice(all_image_array, lyric_array, self.slice_size)
+
+        rank_idx = np.argsort(pair_score, axis = 1)
+        all_image_lyric_score_array = 1 - all_image_lyric_gap_array
+        raw_dcg = [sum([all_image_lyric_score_array[image_idx][rank_idx[image_idx][idx]] / math.log(idx+2, 2) \
+                for idx in range(ndcg_num)]) for image_idx in range(len(rank_idx))]
+        
+        best_rank_idx = [sorted(list(rank_idx[image_idx][:20]), reverse = 1, \
+                key = lambda x: all_image_lyric_score_array[image_idx][x]) for image_idx in range(len(rank_idx))]
+        best_dcg = [sum([all_image_lyric_score_array[image_idx][best_rank_idx[image_idx][idx]] / math.log(idx+2, 2) \
+                for idx in range(ndcg_num)]) for image_idx in range(len(rank_idx))]
+
+        return np.mean(np.array(raw_dcg) / np.array(best_dcg))
+
+    def run_pair_score_in_slice(self, all_image_array, lyric_array, slice_size):
+        image_num = len(all_image_array)
+        outcome_list = []
+
+        start_idx = 0
+        while start_idx < image_num:
+            feed_dict = {self.image_input: all_image_array[start_idx: min(start_idx + slice_size, image_num)], \
+                    self.lyric_input: lyric_array}
+            outcome_list += [self.sess.run(self.pair_score, feed_dict = feed_dict)]
+            
+            start_idx += slice_size
+
+        return np.concatenate(outcome_list, axis = 0)
 
     def conv_layer(self, input_placeholder, filter_size, filter_num, pool_size):
-        conv_filter = tf.Variable(tf.random_normal(shape = [1, filter_size, tf.cast(input_placeholder.shape[3], tf.int32), filter_num], stddev = self.weight_stddev, dtype = tf.float32))
-        input_placeholder = tf.nn.conv2d(input_placeholder, conv_filter, [1, 1, 1, -1], padding = 'SAME')
+        filter_shape = [1, filter_size, tf.cast(input_placeholder.shape[3], tf.int32), filter_num]
+        conv_filter = tf.Variable(tf.random_normal(shape = filter_shape, stddev = self.weight_stddev, dtype = tf.float32))
+
+        input_placeholder = tf.nn.conv2d(input_placeholder, conv_filter, [1, 1, 1, 1], padding = 'SAME')
         output_placeholder = tf.nn.max_pool(input_placeholder, [1, 1, pool_size, 1], [1, 1, 1, 1], padding = 'SAME')
+        
         return output_placeholder
 
     def shuffle_dictionary(self, dictionary):
         sample_num = len(dictionary[list(dictionary.keys())[0]])
         order = np.random.permutation(sample_num)
-        return {k: v[order] for k, v in dictionary.get_items()}
+        
+        return {k: v[order] for k, v in dictionary.items()}
 
     def get_batch(self, feed_dict, batch_size, start_idx):
-        return {k: v[start_idx: start_idx + batch_size] for k, v in feed_dict.get_items()}
+        
+        return {k: v[start_idx: start_idx + batch_size] for k, v in feed_dict.items()}
 
     def get_node_num_list(self, input_dimension, output_dimension, layer_num):
         gap = (output_dimension - input_dimension) / layer_num
+        
         return [int(input_dimension + gap * (layer_idx + 1)) for layer_idx in range(layer_num)]
 
     def fully_connected_layer(self, input_placeholder, output_dimension): 
@@ -247,13 +303,27 @@ class Structured_SVM(object):
         return tf.reshape(tf.matmul(reshaped_input_placeholder, weight) + bias, [-1, input_dimension1, output_dimension])
 
 if __name__ == '__main__':
-    print ('running data...')
+
     data_formater = Data_formater()
     data_formater.load_embedding_dictionary(vectors_file_name = 'vectors.pkl', word2id_file_name = 'word2id.pkl')
     data_formater.load_lyrics('lyric_data', lyric_fixed_length = 40)
-    data_formater.load_images('cross_va_data', list(range(10)))
+    data_formater.load_images('cross_va_data', list(range(9)))
     data_formater.build_model_inputs()
 
-    print ('running model...')
-    structured_SVM = Structured_SVM(weight_stddev = 0.1, bias_stddev = 0.01)
-    structured_SVM.build_model(image_dimension = data_formater.image_dimension, lyric_length = data_formater.lyric_length, lyric_num = data_formater.lyric_num, fully_connected_layer_num = 2, embedding_dimension = 32, C = 0.8, embedding_table = data_formater.embedding_table, pool_size = 2, conv_filter_num_list = [16, 32], filter_size = 3)
+    validate_data_formater = Data_formater()
+    validate_data_formater.load_embedding_dictionary(vectors_file_name = 'vectors.pkl', word2id_file_name = 'word2id.pkl')
+    validate_data_formater.load_lyrics('lyric_data', lyric_fixed_length = 40)
+    validate_data_formater.load_images('cross_va_data', [9])
+    
+    structured_SVM = Structured_SVM(weight_stddev = 0.1, bias_stddev = 0.01, slice_size = 128)
+
+    structured_SVM.build_model(image_dimension = data_formater.image_dimension, lyric_length = data_formater.lyric_length, \
+            lyric_num = data_formater.lyric_num, fully_connected_layer_num = 2, embedding_dimension = 32, C = 0.8, \
+            embedding_table = data_formater.embedding_table, pool_size = 2, conv_filter_num_list = [8, 16, 32], filter_size = 3)
+
+    structured_SVM.train_model(learning_rate = 0.001, epoch_num = 1000, batch_size = 32, \
+            image_input = data_formater.image_input, lyric_gap_input = data_formater.lyric_gap_input, \
+            answer_lyric_idx_input = data_formater.answer_lyric_idx_input, lyric_array = data_formater.lyric_array, \
+            all_image_array = data_formater.all_image_array, all_image_lyric_gap_array = data_formater.all_image_lyric_gap_array,\
+            val_all_image_array = validate_data_formater.all_image_array, \
+            val_all_image_lyric_gap_array = validate_data_formater.all_image_lyric_gap_array, ndcg_num = 5)
